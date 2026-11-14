@@ -4,15 +4,21 @@
  * Agent tools that let the model:
  *   1. create a brand-new Harness session,
  *   2. inject one message into any existing session (queued, or steering),
- *   3. list visible sessions (to find an id), and
- *   4. cancel the running turn of one session.
+ *   3. list visible sessions (to find an id),
+ *   4. cancel the running turn of one session,
+ *   5. read one session's passive state (running, queue depth, pending input),
+ *   6. wait for a session to become observable instead of polling with sleep,
+ *   7. search session history for a literal string.
  *
- * All four are thin, faithful wrappers over the already-composed
+ * Every one is a thin, faithful wrapper over the already-composed
  * `ctx.sessionController` Host service:
  *   - `create(request)`  -> { sessionId, agentPreset? }
  *   - `prompt(request)`  -> { accepted: true }
  *   - `list(request)`    -> { items: [...] }
  *   - `cancel(request)`  -> { accepted: boolean }
+ *   - `state(request)`   -> { cursor, active, running, queue, pendingInput }
+ *   - `wait(request)`    -> { reason, state, output: { records, truncated } }
+ *   - `search(request)`  -> { items: [{ sessionId, snippet }], hasMore }
  *
  * `prompt` is the same admission path the Web composer uses, so an injected
  * message lands in the target Session log as a durable user message. Called
@@ -415,10 +421,244 @@ function createCancelTool(ctx) {
   }
 }
 
+function createStateTool(ctx) {
+  return {
+    name: 'session_state',
+    description:
+      '读取一个会话的被动状态：是否正在运行、已排队但未处理的输入条数、正在等待用户处理的交互（审批/提问）。只读，不会唤醒冷会话。',
+    parameters: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: '目标会话 id。' },
+      },
+      required: ['sessionId'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string' },
+          running: { type: 'boolean' },
+          active: { type: 'boolean' },
+          cursor: { type: 'number' },
+          queued: { type: 'number' },
+          pendingInput: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['sessionId', 'running', 'active', 'cursor', 'queued'],
+        additionalProperties: false,
+      },
+      render: (args, value) => {
+        const parts = [value.running ? 'running' : 'idle']
+        if (value.queued > 0) parts.push(`queue=${value.queued}`)
+        if (value.pendingInput?.length) parts.push(`pending=${value.pendingInput.join('/')}`)
+        return [{ type: 'text', text: `会话 ${value.sessionId}：${parts.join('，')}（cursor=${value.cursor}）` }]
+      },
+    },
+    async execute(rawArgs) {
+      const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {}
+      const sessionId = nonEmptyString(args.sessionId)
+      if (!sessionId) throw new Error('sessionId 不能为空。')
+
+      const controller = controllerOf(ctx)
+      let state
+      try {
+        state = await controller.state({ sessionId }, signalOf())
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (/not found|not attached/i.test(message)) {
+          throw new Error(`找不到会话 ${sessionId}：它不存在、已被删除，或不属于当前 profile。`)
+        }
+        throw error
+      }
+
+      const queue = Array.isArray(state?.queue) ? state.queue : []
+      const pendingInput = Array.isArray(state?.pendingInput) ? state.pendingInput.map(String) : []
+      return {
+        sessionId,
+        running: state?.running === true,
+        active: state?.active === true,
+        cursor: Number(state?.cursor ?? 0),
+        queued: queue.length,
+        ...(pendingInput.length ? { pendingInput } : {}),
+      }
+    },
+  }
+}
+
+/** Fold one `assistant/message` event into plain text plus its input-token count. */
+function assistantFacts(records) {
+  let text = ''
+  let inputTokens
+  for (const record of records) {
+    const event = record?.event
+    if (!event || event.type !== 'assistant/message') continue
+    const content = Array.isArray(event.data?.message?.content) ? event.data.message.content : []
+    const parts = content.filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text)
+    if (parts.length) text = parts.join('\n')
+    const usage = event.data?.usage
+    if (typeof usage?.inputTokens === 'number') inputTokens = usage.inputTokens
+  }
+  return { text, inputTokens }
+}
+
+function createWaitTool(ctx) {
+  return {
+    name: 'session_wait',
+    description:
+      '等待一个会话进入可观察状态：空闲（idle）、等待用户输入（input-required）或超时（timeout），并返回该窗口内助手最新一条消息的文本与本次请求的输入 token 数。用于替代 sleep 轮询——由宿主在事件发生时返回。',
+    parameters: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: '目标会话 id。' },
+        timeoutMs: {
+          type: 'number',
+          description: '最长等待毫秒数，默认 60000，范围 1000-600000。',
+        },
+        afterSeq: {
+          type: 'number',
+          description: '只看该事件序号之后的记录；省略时从会话当前进度开始。',
+        },
+        maxMessages: {
+          type: 'number',
+          description: '最多返回多少条事件记录，默认 200。',
+        },
+      },
+      required: ['sessionId'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string' },
+          reason: { type: 'string', enum: ['idle', 'input-required', 'timeout'] },
+          running: { type: 'boolean' },
+          cursor: { type: 'number' },
+          queued: { type: 'number' },
+          text: { type: 'string' },
+          inputTokens: { type: 'number' },
+          truncated: { type: 'boolean' },
+        },
+        required: ['sessionId', 'reason', 'running', 'truncated'],
+        additionalProperties: false,
+      },
+      render: (args, value) => {
+        const lines = [`会话 ${value.sessionId}：${value.reason}（running=${value.running}，cursor=${value.cursor}）`]
+        if (value.queued > 0) lines.push(`排队输入：${value.queued}`)
+        if (typeof value.inputTokens === 'number') lines.push(`输入 token：${value.inputTokens}`)
+        if (value.text) lines.push('', value.text)
+        if (value.truncated) lines.push('', `（输出已截断，可提高 maxMessages 后重试）`)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    async execute(rawArgs) {
+      const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {}
+      const sessionId = nonEmptyString(args.sessionId)
+      if (!sessionId) throw new Error('sessionId 不能为空。')
+
+      const request = { sessionId }
+      const timeout = Number(args.timeoutMs)
+      if (Number.isFinite(timeout)) request.timeoutMs = Math.min(600000, Math.max(1000, Math.trunc(timeout)))
+      const afterSeq = Number(args.afterSeq)
+      if (Number.isFinite(afterSeq)) request.afterSeq = Math.trunc(afterSeq)
+      const maxMessages = Number(args.maxMessages)
+      if (Number.isFinite(maxMessages)) request.maxMessages = Math.min(5000, Math.max(1, Math.trunc(maxMessages)))
+
+      const controller = controllerOf(ctx)
+      let waited
+      try {
+        waited = await controller.wait(request, signalOf())
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (/not found|not attached/i.test(message)) {
+          throw new Error(`找不到会话 ${sessionId}：它不存在、已被删除，或不属于当前 profile。`)
+        }
+        throw error
+      }
+
+      const records = Array.isArray(waited?.output?.records) ? waited.output.records : []
+      const { text, inputTokens } = assistantFacts(records)
+      const queue = Array.isArray(waited?.state?.queue) ? waited.state.queue : []
+
+      return {
+        sessionId,
+        reason: waited?.reason ?? 'timeout',
+        running: waited?.state?.running === true,
+        cursor: Number(waited?.state?.cursor ?? 0),
+        queued: queue.length,
+        text: text.slice(0, 8000),
+        ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
+        truncated: waited?.output?.truncated === true,
+      }
+    },
+  }
+}
+
+function createSearchTool(ctx) {
+  return {
+    name: 'session_search',
+    description:
+      '在所有可见会话的历史里按字面文本检索（不是语义检索），返回命中的会话 id 与上下文片段。用于在不知道 id 时先定位会话。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '要检索的字面文本。' },
+        limit: { type: 'number', description: '最多返回多少条，默认 10，范围 1-50。' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string' },
+          count: { type: 'number' },
+          hasMore: { type: 'boolean' },
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { sessionId: { type: 'string' }, snippet: { type: 'string' } },
+              required: ['sessionId', 'snippet'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['query', 'count', 'hasMore', 'items'],
+        additionalProperties: false,
+      },
+      render: (args, value) => {
+        if (value.count === 0) return [{ type: 'text', text: `没有会话命中「${value.query}」。` }]
+        const rows = value.items.map((item) => `- ${item.sessionId}\n  ${item.snippet.replace(/\s+/g, ' ').slice(0, 200)}`)
+        const more = value.hasMore ? '\n（还有更多命中，请改用更精确的 query）' : ''
+        return [{ type: 'text', text: `${value.count} 个命中：\n${rows.join('\n')}${more}` }]
+      },
+    },
+    async execute(rawArgs) {
+      const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {}
+      const query = nonEmptyString(args.query)
+      if (!query) throw new Error('query 不能为空。')
+
+      const rawLimit = Number(args.limit)
+      const limit = Number.isFinite(rawLimit) ? Math.min(50, Math.max(1, Math.trunc(rawLimit))) : 10
+
+      const controller = controllerOf(ctx)
+      const value = await controller.search({ query }, signalOf())
+      const items = (Array.isArray(value?.items) ? value.items : []).slice(0, limit).map((item) => ({
+        sessionId: String(item.sessionId),
+        snippet: String(item.snippet ?? ''),
+      }))
+      return { query, count: items.length, hasMore: value?.hasMore === true, items }
+    },
+  }
+}
+
 /* ─────────────────────────────── entry ─────────────────────────────── */
 
 /**
- * Register the four session tools.
+ * Register the session tools.
  * @param ctx Cordis plugin context.
  */
 export function apply(ctx) {
@@ -444,6 +684,9 @@ export function apply(ctx) {
     createInjectTool(ctx),
     createListTool(ctx),
     createCancelTool(ctx),
+    createStateTool(ctx),
+    createWaitTool(ctx),
+    createSearchTool(ctx),
   ]) {
     effect(() => ctx.tools.register(tool), `${name}.tool.${tool.name}()`)
   }

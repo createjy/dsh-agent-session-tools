@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-session-tools",
-  "version": "0.1.1",
-  "description": "Agent tools for DeepSeek Harness sessions: create a session, inject a queued or steering message into any session, list sessions, and cancel a running turn. 给 DeepSeek Harness Agent 用的会话工具：新建会话、向任意会话注入消息（排队/引导）、列出会话、取消当前轮次。",
+  "version": "0.2.0",
+  "description": "Agent tools for DeepSeek Harness sessions: create a session, inject a queued or steering message, list/search sessions, read a session state, wait for it to settle, and cancel a running turn. 给 DeepSeek Harness Agent 用的会话工具：新建会话、注入消息（排队/引导）、列出与检索会话、读取状态、等待状态变化、取消当前轮次。",
   "license": "MIT",
   "author": "zgq0106 (https://github.com/zgq0106)",
   "repository": {
@@ -36,7 +36,8 @@
     "test": "node test/smoke.mjs"
   },
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.5 <0.3.0"
   },
   "keywords": [
     "deepseek-harness",

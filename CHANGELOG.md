@@ -2,6 +2,21 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 0.2.0 — 2026-11-14
+
+把内核里早就有、插件却一直没暴露的三个只读能力接出来：`session_state`、`session_wait`、`session_search`。同时补上真正生效的宿主版本门禁。
+
+### 新增
+
+- **`session_state`**：`sessionController.state()` 的封装，返回 `running` / `active` / `cursor` / `queued` / `pendingInput`。用于“先看它在不在跑、在等什么”而不必唤醒会话。
+- **`session_wait`**：`sessionController.wait()` 的封装。等会话进入 `idle` / `input-required` / `timeout`，并回传窗口内最后一条助手消息的纯文本与 `inputTokens`。这是 `sleep` + 轮询的替代品；`inputTokens` 取自 `assistant/message` 事件的 `usage.inputTokens`——`state()` 里没有任何 token 字段，上下文水位只能从这里读。
+- **`session_search`**：`sessionController.search()` 的封装，按字面文本（非语义）检索会话历史，返回 `sessionId` + `snippet` + `hasMore`，用于在不知道 id 时先定位。
+
+### 变更
+
+- `engines.dsh: ">=0.2.1-rc.5 <0.3.0"`：DSH 的 app-boot 在激活前评估 `engines.dsh`（缺失时回落到 DSH peer 依赖），这是真正会拦住不兼容宿主的声明。`dsh.compatibility.dshReleases` 保留，但它只是展示字段，运行时不读取。
+- 冒烟测试 74 → 117 项断言（Windows 上 115），覆盖七个工具的全部 `execute()` 路径。
+
 ## 0.1.1 — 2026-11-14
 
 首个**跨平台**版本：macOS / Linux / Windows 用同一份代码、同一份测试。起因是在 macOS 上跑 `npm test` 直接崩，顺手把一处会误导的报错和两处与结果对不上的返回值一起修了。
@@ -22,8 +37,8 @@
 
 ### 测试
 
-- 断言 59 → 74（Windows 上 72：POSIX 专属的 3 项换成 1 项 Windows 专属检查）：新增 `session_cancel` 的三种结局（running / idle / not-found）、存储不可读时的回退路径、跨平台 `cwd` 拒绝。
-- 新增 `.github/workflows/ci.yml`：macOS / Ubuntu / Windows × Node 22 / 24 全矩阵跑 `node --check` + `npm test`；六个 job 已在 CI 上实跑通过。
+- 断言 59 → 74：新增 `session_cancel` 的三种结局（running / idle / not-found）、存储不可读时的回退路径、跨平台 `cwd` 拒绝。
+- 新增 `.github/workflows/ci.yml`：macOS / Ubuntu / Windows × Node 22 / 24 全矩阵跑 `node --check` + `npm test`。
 
 ## 0.1.0 — 2026-11-01
 

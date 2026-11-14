@@ -29,6 +29,9 @@ This plugin adds that entry point. It does not reimplement anything: it calls th
 | `session_inject` | Deliver one message into a session | `sessionController.prompt()` |
 | `session_list` | List visible sessions, to find an id | `sessionController.list()` |
 | `session_cancel` | Cancel a session's running turn | `sessionController.cancel()` |
+| `session_state` | Passive state: running, queue depth, pending input | `sessionController.state()` |
+| `session_wait` | Wait for idle / input-required / timeout and fetch the latest assistant text | `sessionController.wait()` |
+| `session_search` | Literal text search across session history | `sessionController.search()` |
 
 ### session_create
 
@@ -60,6 +63,27 @@ Returns `{ accepted, sessionId, mode, requestId }`.
 | `limit` | no | Rows to return, default 20, range 1–100 |
 
 Read-only, never wakes a cold session. Each row carries `running` / `blank` / `origin` / `cwd`.
+
+### session_state
+
+Parameters: `sessionId` (required). Returns `running`, `active`, `cursor`, `queued` (inputs waiting in the queue) and `pendingInput` (`approval`, `question`, `other`). Read-only; it does not wake a cold session.
+
+### session_wait
+
+| Parameter | Required | Description |
+|---|---|---|
+| `sessionId` | yes | Target session |
+| `timeoutMs` | no | Maximum wait in milliseconds, default 60000, range 1000–600000 |
+| `afterSeq` | no | Only consider records after this event seq |
+| `maxMessages` | no | Maximum event records to return, default 200, cap 5000 |
+
+Returns `reason` (`idle` / `input-required` / `timeout`), `running`, `cursor`, `queued`, `text` (plain text of the last assistant message in the window), `inputTokens` (input tokens of that model request, taken from the `assistant/message` event's `usage.inputTokens`) and `truncated`.
+
+It replaces sleeping and polling: the host answers when an event happens. `inputTokens` is the only real source for context usage — `state()` carries no token fields at all.
+
+### session_search
+
+Parameters: `query` (required, literal text, not semantic search) and `limit` (default 10, range 1–50). Returns `items: [{ sessionId, snippet }]` and `hasMore`.
 
 ### session_cancel
 
@@ -128,6 +152,7 @@ This package stays deliberately narrow: a **Host-only tool layer** that calls `s
 | Verified on | DSH `0.2.1-rc.5` (Windows, Node 24.21.0) and `0.2.2-rc.3` (macOS arm64, Node 26.12.1) |
 | Platforms | macOS / Linux / Windows — only `node:path` and `process.platform`, no native addon, no platform-specific dependency |
 | Node | `^22.19.0 \|\| >=24.0.0` (same range as DSH ecosystem plugins) |
+| Host gate | `engines.dsh: >=0.2.1-rc.5 <0.3.0`. DSH's app-boot evaluates `engines.dsh` (falling back to DSH peer dependencies) before activation, so that is the declaration that actually blocks an incompatible Host; `dsh.compatibility.dshReleases` is a display-only field that no runtime code reads |
 | Dependencies | Only `ctx.sessionController` and built-in `node:path`; nothing bundled |
 | Build | None — `index.js` is the shipped artifact |
 
@@ -142,9 +167,9 @@ node --check index.js
 node test/smoke.mjs        # or npm test
 ```
 
-`test/smoke.mjs` runs offline: a fake Cordis context and a stub `sessionController` drive the real `apply()`, covering registration shape, every `execute()` path, argument rejection, idempotency, and the three `session_cancel` outcomes (running / idle / not-found). No DSH process, port or interaction needed — 74 assertions (72 on Windows: the three POSIX-only checks are replaced by one Windows-only one).
+`test/smoke.mjs` runs offline: a fake Cordis context and a stub `sessionController` drive the real `apply()`, covering registration shape, every `execute()` path of all seven tools, argument rejection, idempotency, the three `session_cancel` outcomes (running / idle / not-found), and `session_wait`'s text/token extraction with parameter clamping. No DSH process, port or interaction needed — 117 assertions (115 on Windows, where platform-specific branches differ).
 
-Fixtures pick their path style from `process.platform`, so the same suite runs on macOS, Linux and Windows; CI (`.github/workflows/ci.yml`) runs it on all three × Node 22/24 — six jobs, all green.
+Fixtures pick their path style from `process.platform`, so the same suite runs on macOS, Linux and Windows; CI (`.github/workflows/ci.yml`) runs it on all three × Node 22/24.
 
 ## License
 

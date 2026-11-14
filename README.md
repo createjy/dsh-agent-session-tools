@@ -31,6 +31,9 @@ Harness 内核里，Agent 想给「别的会话」发消息，原本只有两条
 | `session_inject` | 向指定会话投递一条消息 | `sessionController.prompt()` |
 | `session_list` | 列出可见会话，用于找 `sessionId` | `sessionController.list()` |
 | `session_cancel` | 取消某会话当前正在跑的轮次 | `sessionController.cancel()` |
+| `session_state` | 读被动状态：是否在跑、排队几条、在等什么交互 | `sessionController.state()` |
+| `session_wait` | 等会话空闲/等输入/超时，并取回最新助手消息 | `sessionController.wait()` |
+| `session_search` | 按字面文本检索会话历史，定位 id | `sessionController.search()` |
 
 ### session_create
 
@@ -62,6 +65,36 @@ Harness 内核里，Agent 想给「别的会话」发消息，原本只有两条
 | `limit` | 否 | 最多返回多少条，默认 20，范围 1–100 |
 
 只读存储，不会唤醒冷会话。每行带 `running` / `blank` / `origin` / `cwd`，便于挑目标。
+
+### session_state
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `sessionId` | 是 | 目标会话 |
+
+返回 `running` / `active` / `cursor` / `queued`（排队未处理的输入条数）/ `pendingInput`（`approval`、`question`、`other`）。只读，不唤醒冷会话。
+
+### session_wait
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `sessionId` | 是 | 目标会话 |
+| `timeoutMs` | 否 | 最长等待毫秒数，默认 60000，范围 1000–600000 |
+| `afterSeq` | 否 | 只看该事件序号之后的记录 |
+| `maxMessages` | 否 | 最多返回多少条事件记录，默认 200，上限 5000 |
+
+返回 `reason`（`idle` / `input-required` / `timeout`）、`running`、`cursor`、`queued`、`text`（该窗口内最后一条助手消息的纯文本）、`inputTokens`（该次模型请求的输入 token 数，来自 `assistant/message` 事件的 `usage.inputTokens`）、`truncated`。
+
+存在的意义是替代 `sleep` 轮询：由宿主在事件发生时返回，而不是让 Agent 反复查。`inputTokens` 是上下文水位唯一的真实来源——`state()` 里没有任何 token 字段。
+
+### session_search
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `query` | 是 | 要检索的字面文本（不是语义检索） |
+| `limit` | 否 | 最多返回多少条，默认 10，范围 1–50 |
+
+返回 `items: [{ sessionId, snippet }]` 与 `hasMore`。
 
 ### session_cancel
 
@@ -135,6 +168,7 @@ Host 半侧（本包全部代码）按包名缓存已导入的模块：**禁用/
 | 实测 DSH | `0.2.1-rc.5`（Windows，Node 24.21.0）、`0.2.2-rc.3`（macOS arm64，Node 26.12.1） |
 | 平台 | macOS / Linux / Windows。只用 `node:path` 与 `process.platform`，无原生扩展、无平台相关依赖 |
 | Node | `^22.19.0 \|\| >=24.0.0`（与 DSH 生态插件同口径） |
+| 宿主版本门禁 | `engines.dsh: >=0.2.1-rc.5 <0.3.0`。DSH 的 app-boot 在装载前评估 `engines.dsh`（缺失时回落到 DSH peer 依赖），这是真正生效的兼容声明；`dsh.compatibility.dshReleases` 只是给 Plugin Manager 看的展示字段，运行时不读取 |
 | 依赖 | 只用 `ctx.sessionController` 与内置 `node:path`，不打包任何第三方依赖 |
 | 构建 | 无。`index.js` 就是发布产物 |
 
@@ -149,9 +183,9 @@ node --check index.js
 node test/smoke.mjs        # 或 npm test
 ```
 
-`test/smoke.mjs` 离线运行：用一个假的 Cordis 上下文和桩 `sessionController` 驱动真实的 `apply()`，覆盖注册形状、四个工具的每条 `execute()` 路径、参数拒绝、幂等、以及 `session_cancel` 的三种结局（running / idle / not-found）。不需要 DSH 进程、端口或交互，74 项断言（Windows 上 72 项：POSIX 专属的 3 项换成 1 项 Windows 专属检查）。
+`test/smoke.mjs` 离线运行：用一个假的 Cordis 上下文和桩 `sessionController` 驱动真实的 `apply()`，覆盖注册形状、七个工具的每条 `execute()` 路径、参数拒绝、幂等、`session_cancel` 的三种结局（running / idle / not-found），以及 `session_wait` 的文本/token 抽取与参数钳制。不需要 DSH 进程、端口或交互，117 项断言（Windows 上 115 项，平台专属分支不同）。
 
-测试夹具按 `process.platform` 取路径风格，所以同一份测试在 macOS、Linux、Windows 上都能跑；CI（`.github/workflows/ci.yml`）在三个平台 × Node 22/24 上各跑一遍，六个 job 已实测全绿。
+测试夹具按 `process.platform` 取路径风格，所以同一份测试在 macOS、Linux、Windows 上都能跑；CI（`.github/workflows/ci.yml`）在三个平台 × Node 22/24 上各跑一遍。
 
 ## 许可
 

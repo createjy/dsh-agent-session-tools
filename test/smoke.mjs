@@ -43,7 +43,7 @@ function renderText(tool, value) {
 }
 
 function callRecord() {
-  return { create: [], prompt: [], list: [], rename: [], cancel: [] }
+  return { create: [], prompt: [], list: [], rename: [], cancel: [], state: [], wait: [], search: [] }
 }
 
 function makeCtx(calls, overrides = {}) {
@@ -74,6 +74,51 @@ function makeCtx(calls, overrides = {}) {
       calls.cancel.push(request)
       return { accepted: true }
     },
+    async state(request) {
+      calls.state.push(request)
+      return {
+        cursor: 42,
+        active: true,
+        running: false,
+        queue: [{ id: 'q1', placement: 'queued', content: [] }, { id: 'q2', placement: 'steering', content: [] }],
+        pendingInput: ['approval'],
+      }
+    },
+    async wait(request) {
+      calls.wait.push(request)
+      return {
+        reason: 'idle',
+        state: { cursor: 77, active: true, running: false, queue: [], pendingInput: [] },
+        output: {
+          records: [
+            {
+              type: 'event',
+              event: {
+                type: 'assistant/message',
+                seq: 77,
+                time: 2,
+                data: {
+                  message: { role: 'assistant', content: [{ type: 'text', text: 'DONE' }, { type: 'tool-call', id: 'c1', name: 'x', arguments: '{}' }] },
+                  usage: { inputTokens: 1234 },
+                },
+              },
+            },
+            { type: 'event', event: { type: 'turn/end', seq: 78, time: 3, data: { kind: 'completed' } } },
+          ],
+          truncated: false,
+        },
+      }
+    },
+    async search(request) {
+      calls.search.push(request)
+      return {
+        items: [
+          { sessionId: 's-a', snippet: 'hit one' },
+          { sessionId: 's-b', snippet: 'hit two' },
+        ],
+        hasMore: true,
+      }
+    },
     ...overrides,
   }
 
@@ -101,13 +146,16 @@ check('apply is a function', typeof apply === 'function')
 
 console.log('— registration —')
 apply(ctx)
-check('registers four tools', registered.length === 4, `got ${registered.length}`)
+check('registers seven tools', registered.length === 7, `got ${registered.length}`)
 
 const byName = Object.fromEntries(registered.map((tool) => [tool.name, tool]))
 check('session_create registered', Boolean(byName.session_create))
 check('session_inject registered', Boolean(byName.session_inject))
 check('session_list registered', Boolean(byName.session_list))
 check('session_cancel registered', Boolean(byName.session_cancel))
+check('session_state registered', Boolean(byName.session_state))
+check('session_wait registered', Boolean(byName.session_wait))
+check('session_search registered', Boolean(byName.session_search))
 
 for (const tool of registered) {
   check(`${tool.name}: has description`, typeof tool.description === 'string' && tool.description.length > 10)
@@ -339,6 +387,90 @@ console.log('— missing service —')
     message = String(error.message)
   }
   check('fails with actionable error', message.includes('sessionController'), message)
+}
+
+
+console.log('— session_state —')
+{
+  const before = calls.state.length
+  const result = await byName.session_state.execute({ sessionId: 's-a' })
+  check('one state call', calls.state.length === before + 1)
+  check('passes sessionId', calls.state.at(-1).sessionId === 's-a')
+  check('reports not running', result.running === false)
+  check('counts queued inputs', result.queued === 2)
+  check('surfaces pending input', result.pendingInput?.[0] === 'approval')
+  check('reports cursor', result.cursor === 42)
+  check('renders state', renderText(byName.session_state, result).includes('queue=2'))
+  let rejected = false
+  try {
+    await byName.session_state.execute({})
+  } catch {
+    rejected = true
+  }
+  check('rejects missing sessionId', rejected)
+}
+
+console.log('— session_state: unknown session —')
+{
+  const notFoundCalls = callRecord()
+  const { ctx: nfCtx } = makeCtx(notFoundCalls, {
+    async state() {
+      throw new Error('session "nope" not found (not attached)')
+    },
+  })
+  const tools = []
+  apply({ ...nfCtx, tools: { register: (tool) => (tools.push(tool), () => {}) } })
+  let message = ''
+  try {
+    await tools.find((tool) => tool.name === 'session_state').execute({ sessionId: 'nope' })
+  } catch (error) {
+    message = String(error.message)
+  }
+  check('maps not-found to an actionable message', message.includes('找不到会话 nope'), message)
+}
+
+console.log('— session_wait —')
+{
+  const before = calls.wait.length
+  const result = await byName.session_wait.execute({ sessionId: 's-a', timeoutMs: 1500, afterSeq: 10, maxMessages: 50 })
+  const request = calls.wait.at(-1)
+  check('one wait call', calls.wait.length === before + 1)
+  check('passes sessionId', request.sessionId === 's-a')
+  check('passes timeoutMs', request.timeoutMs === 1500)
+  check('passes afterSeq', request.afterSeq === 10)
+  check('passes maxMessages', request.maxMessages === 50)
+  check('reports reason', result.reason === 'idle')
+  check('reports running=false', result.running === false)
+  check('extracts assistant text only', result.text === 'DONE', result.text)
+  check('reports input tokens', result.inputTokens === 1234)
+  check('reports truncation', result.truncated === false)
+  check('renders text', renderText(byName.session_wait, result).includes('DONE'))
+}
+
+console.log('— session_wait: clamping —')
+{
+  await byName.session_wait.execute({ sessionId: 's-a', timeoutMs: 1, maxMessages: 100000 })
+  const request = calls.wait.at(-1)
+  check('clamps timeoutMs low', request.timeoutMs === 1000, String(request.timeoutMs))
+  check('clamps maxMessages high', request.maxMessages === 5000, String(request.maxMessages))
+}
+
+console.log('— session_search —')
+{
+  const before = calls.search.length
+  const result = await byName.session_search.execute({ query: '  鹈鹕  ', limit: 1 })
+  check('one search call', calls.search.length === before + 1)
+  check('trims query', calls.search.at(-1).query === '鹈鹕')
+  check('limits items', result.count === 1)
+  check('reports hasMore', result.hasMore === true)
+  check('renders hits', renderText(byName.session_search, result).includes('s-a'))
+  let rejected = false
+  try {
+    await byName.session_search.execute({ query: '   ' })
+  } catch {
+    rejected = true
+  }
+  check('rejects blank query', rejected)
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)
