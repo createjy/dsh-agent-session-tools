@@ -10,6 +10,17 @@
 
 import { apply, inject, name } from '../index.js'
 
+const isWindows = process.platform === 'win32'
+
+/** A path that is really absolute on the platform running this test. */
+const ABS_CWD = isWindows ? 'C:\\proj' : '/home/me/proj'
+
+/** Absolute on the *other* platform: rejected on POSIX, ordinary on Windows. */
+const FOREIGN_CWD = isWindows ? '/home/me/proj' : 'C:\\proj'
+
+/** Sample cwd carried through session_list, in host style. */
+const SAMPLE_CWD = isWindows ? 'C:\\work\\a' : '/work/a'
+
 let passed = 0
 let failed = 0
 
@@ -21,6 +32,14 @@ function check(label, condition, detail) {
     failed += 1
     console.log(`  FAIL  ${label}${detail ? ` — ${detail}` : ''}`)
   }
+}
+
+/** Flatten a tool's output.render() result to plain text, as the Host does. */
+function renderText(tool, value) {
+  return tool.output
+    .render({}, value)
+    .map((part) => part.text)
+    .join('\n')
 }
 
 function callRecord() {
@@ -42,7 +61,7 @@ function makeCtx(calls, overrides = {}) {
       calls.list.push(true)
       return {
         items: [
-          { sessionId: 's-a', updatedAt: 1700000000000, running: true, blank: false, cwd: 'E:\\a' },
+          { sessionId: 's-a', updatedAt: 1700000000000, running: true, blank: false, cwd: SAMPLE_CWD },
           { sessionId: 's-b', updatedAt: 1700000001000, running: false, blank: true, origin: 'subagent' },
         ],
       }
@@ -102,10 +121,10 @@ for (const tool of registered) {
 
 console.log('— session_create —')
 {
-  const result = await byName.session_create.execute({ cwd: '  E:\\proj  ', agentPreset: 'preset-x', title: 'T1' })
+  const result = await byName.session_create.execute({ cwd: `  ${ABS_CWD}  `, agentPreset: 'preset-x', title: 'T1' })
   const request = calls.create.at(-1)
   check('returns sessionId', result.sessionId === 'session-test-1')
-  check('trims cwd', request.cwd === 'E:\\proj')
+  check('trims cwd', request.cwd === ABS_CWD)
   check('passes agentPreset', request.agentPreset === 'preset-x')
   check('echoes agentPreset', result.agentPreset === 'preset-x')
   check('applies title via rename', calls.rename.at(-1)?.title === 'T1')
@@ -132,6 +151,25 @@ console.log('— session_create: rejects a relative cwd —')
   }
   check('rejects relative cwd', message.includes('绝对路径'), message || 'no error thrown')
   check('no create call on rejection', calls.create.length === before)
+}
+
+console.log('— session_create: cwd style must match the host —')
+{
+  const before = calls.create.length
+  let message = ''
+  try {
+    await byName.session_create.execute({ cwd: FOREIGN_CWD })
+  } catch (error) {
+    message = String(error.message)
+  }
+  if (isWindows) {
+    // POSIX-style paths are absolute on Windows too, so this is simply accepted.
+    check('POSIX path accepted on Windows', calls.create.length === before + 1, message || 'no create call')
+  } else {
+    check('rejects a Windows path on POSIX', message.includes('Windows 绝对路径'), message || 'no error thrown')
+    check('names the host platform', message.includes(`当前 Host 运行在 ${process.platform}`), message)
+    check('no create call on rejection', calls.create.length === before)
+  }
 }
 
 console.log('— session_create: accepts a POSIX absolute cwd —')
@@ -218,19 +256,65 @@ console.log('— session_list —')
   const result = await byName.session_list.execute({ limit: 1 })
   check('honours limit', result.count === 1 && result.sessions.length === 1)
   check('maps updatedAt to ISO', /^\d{4}-\d{2}-\d{2}T/.test(result.sessions[0].updatedAt))
-  check('keeps cwd', result.sessions[0].cwd === 'E:\\a')
+  check('keeps cwd', result.sessions[0].cwd === SAMPLE_CWD)
 
   const all = await byName.session_list.execute({})
   check('defaults to every row', all.count === 2)
   check('keeps origin', all.sessions.some((row) => row.origin === 'subagent'))
 }
 
-console.log('— session_cancel —')
+console.log('— session_cancel: running session —')
 {
-  const result = await byName.session_cancel.execute({ sessionId: 's-target' })
+  const before = calls.cancel.length
+  const result = await byName.session_cancel.execute({ sessionId: 's-a' })
   check('accepted', result.accepted === true)
-  check('routes to the session', calls.cancel.at(-1)?.sessionId === 's-target')
+  check('routes to the session', calls.cancel.at(-1)?.sessionId === 's-a')
+  check('calls the controller once', calls.cancel.length === before + 1)
+  check('renders the accepted branch', renderText(byName.session_cancel, result).includes('已请求取消'))
+}
 
+console.log('— session_cancel: idle session is not a cancel —')
+{
+  const before = calls.cancel.length
+  const result = await byName.session_cancel.execute({ sessionId: 's-b' })
+  check('accepted is false', result.accepted === false)
+  check('reason is idle', result.reason === 'idle')
+  check('does not touch the controller', calls.cancel.length === before)
+  check('render says idle', renderText(byName.session_cancel, result).includes('空闲'))
+}
+
+console.log('— session_cancel: unknown session —')
+{
+  const before = calls.cancel.length
+  const result = await byName.session_cancel.execute({ sessionId: 'session-does-not-exist' })
+  check('accepted is false', result.accepted === false)
+  check('reason is not-found', result.reason === 'not-found')
+  check('does not touch the controller', calls.cancel.length === before)
+  check('render says not found', renderText(byName.session_cancel, result).includes('找不到会话'))
+}
+
+console.log('— session_cancel: unreadable store falls through —')
+{
+  const fallbackCalls = callRecord()
+  const { ctx: noListCtx } = makeCtx(fallbackCalls, {
+    async list() {
+      throw new Error('list boom')
+    },
+  })
+  const tools = []
+  noListCtx.tools.register = (tool) => {
+    tools.push(tool)
+    return () => {}
+  }
+  apply(noListCtx)
+  const tool = tools.find((entry) => entry.name === 'session_cancel')
+  const result = await tool.execute({ sessionId: 's-x' })
+  check('falls back to the controller', result.accepted === true && fallbackCalls.cancel.length === 1)
+}
+
+console.log('— session_cancel: rejects missing sessionId —')
+{
+  const before = calls.cancel.length
   let missing = false
   try {
     await byName.session_cancel.execute({})
@@ -238,6 +322,7 @@ console.log('— session_cancel —')
     missing = true
   }
   check('rejects missing sessionId', missing)
+  check('no cancel call on rejection', calls.cancel.length === before)
 }
 
 console.log('— missing service —')

@@ -17,6 +17,7 @@ This plugin adds that entry point. It does not reimplement anything: it calls th
 
 ## Why it stays light
 
+- **Cross-platform by construction.** macOS, Linux and Windows run the same code. Path validation follows the **host platform**: on macOS/Linux, `E:\proj` is not mislabelled "relative" — it is rejected with a message saying it is a Windows path this Host cannot use. The test matrix runs on all three.
 - **Single file, zero dependencies, zero build.** The runtime is just `index.js`, using only built-in `node:path`; nothing third-party is bundled and there is no build step. Edit `index.js`, **restart DSH, and the change is live** — no reinstall, no compile, no bundling wait. (The restart is required: the Loader caches imported Host modules per package name, so disabling/enabling does not re-read the file.)
 - **Uninstalling leaves nothing behind.** Removal drops the plugin's loader row and its package directory — no config writes, no data directory, no background tasks, no takeover of existing sessions. Harness returns to its pre-install state. The one caveat is usage rather than installation: **messages already injected stay in the target session logs; uninstalling does not recall them.**
 
@@ -33,7 +34,7 @@ This plugin adds that entry point. It does not reimplement anything: it calls th
 
 | Parameter | Required | Notes |
 |---|---|---|
-| `cwd` | no | **Absolute** working directory for the new session; omit for the Harness default. A relative path is rejected rather than resolved against the Host process's cwd, which the caller cannot see |
+| `cwd` | no | **Absolute** working directory for the new session, in the host's own style (`/home/me/proj` on macOS/Linux, `C:\proj` on Windows); omit for the Harness default. A relative path is rejected rather than resolved against the Host process's cwd, and a path written for the other platform is rejected with a message naming the mismatch |
 | `agentPreset` | no | Agent preset id; omit for the configured default |
 | `title` | no | Set the title right after creation |
 
@@ -67,6 +68,15 @@ Read-only, never wakes a cold session. Each row carries `running` / `blank` / `o
 | `sessionId` | yes | Target session |
 
 Sends a cancel request and **keeps** queued messages. When a session is stuck on an unsettled tool call this is the only way back: the turn ends, then the queue moves.
+
+Returns `{ sessionId, accepted, reason? }`. Only `accepted=true` means a turn was really cancelled; otherwise `accepted=false` carries a `reason`:
+
+| `reason` | Meaning | Why it matters |
+|---|---|---|
+| `idle` | the session exists but has no running turn | no false "cancel requested"; queued messages are untouched |
+| `not-found` | no such session, or not in this profile | a structured answer instead of a thrown error, so the agent can fix the id |
+
+(0.1.0 passed the service's answer straight through: an idle session also reported `accepted=true`, and an unknown id threw. 0.1.1 reads the store first, so the answer matches reality.)
 
 ## Install
 
@@ -115,7 +125,8 @@ This package stays deliberately narrow: a **Host-only tool layer** that calls `s
 
 | Item | Value |
 |---|---|
-| Verified on | DSH `0.2.1-rc.5`, Windows, Node 24.21.0 |
+| Verified on | DSH `0.2.1-rc.5` (Windows, Node 24.21.0) and `0.2.2-rc.3` (macOS arm64, Node 26.12.1) |
+| Platforms | macOS / Linux / Windows — only `node:path` and `process.platform`, no native addon, no platform-specific dependency |
 | Node | `^22.19.0 \|\| >=24.0.0` (same range as DSH ecosystem plugins) |
 | Dependencies | Only `ctx.sessionController` and built-in `node:path`; nothing bundled |
 | Build | None — `index.js` is the shipped artifact |
@@ -131,7 +142,9 @@ node --check index.js
 node test/smoke.mjs        # or npm test
 ```
 
-`test/smoke.mjs` runs offline: a fake Cordis context and a stub `sessionController` drive the real `apply()`, covering registration shape, every `execute()` path, argument rejection and idempotency. No DSH process, port or interaction needed.
+`test/smoke.mjs` runs offline: a fake Cordis context and a stub `sessionController` drive the real `apply()`, covering registration shape, every `execute()` path, argument rejection, idempotency, and the three `session_cancel` outcomes (running / idle / not-found). No DSH process, port or interaction needed — 74 assertions.
+
+Fixtures pick their path style from `process.platform`, so the same suite runs on macOS, Linux and Windows; CI (`.github/workflows/ci.yml`) runs it on all three × Node 22/24.
 
 ## License
 

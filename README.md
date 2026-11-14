@@ -20,6 +20,7 @@ Harness 内核里，Agent 想给「别的会话」发消息，原本只有两条
 ## 特点
 
 - **单文件、零依赖、零构建**：运行时代码只有 `index.js` 一个文件，只用内置 `node:path`，不打包任何第三方依赖，也没有构建步骤。改完 `index.js` **重启 DSH 即生效**——不用重装、不用编译、不用等打包。（不重启不生效：Loader 按包名缓存已导入的模块，禁用/启用也不会重读。）
+- **跨平台**：macOS / Linux / Windows 同一份代码。路径校验按**宿主平台**判定——在 macOS/Linux 上传 `E:\proj` 不会被当成“相对路径”，而是明确告诉你这是 Windows 路径、当前 Host 用不了。测试矩阵在三个平台各跑一遍。
 - **卸载无副作用**：卸载只移除这个插件的加载行和包目录。它不写任何配置、不建数据目录、不注册后台任务、不接管现有会话，卸完 Harness 回到装之前的样子。唯一要说明的是使用痕迹——**已经注入的消息留在目标会话日志里，卸载不会撤销它们**；那是注入这一步造成的，不是卸载造成的。
 
 ## 提供的工具
@@ -35,7 +36,7 @@ Harness 内核里，Agent 想给「别的会话」发消息，原本只有两条
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `cwd` | 否 | 新会话工作目录的**绝对路径**；省略用 Harness 默认目录。传相对路径会被拒绝（宿主进程的当前目录调用方看不到，不替调用方猜） |
+| `cwd` | 否 | 新会话工作目录的**绝对路径**，且须与宿主平台一致（macOS/Linux 传 `/home/me/proj`，Windows 传 `C:\proj`）；省略用 Harness 默认目录。相对路径会被拒绝（宿主进程的当前目录调用方看不到，不替调用方猜）；跨平台路径（如在 POSIX 上传 Windows 盘符路径）也会被拒绝，并说明是哪一侧不匹配 |
 | `agentPreset` | 否 | 预设 id；省略用默认预设 |
 | `title` | 否 | 创建后立即设置的标题 |
 
@@ -69,6 +70,15 @@ Harness 内核里，Agent 想给「别的会话」发消息，原本只有两条
 | `sessionId` | 是 | 目标会话 |
 
 只发取消请求，**不丢弃**已排队的消息。会话卡在未结算的工具调用上时，它是唯一能救回来的手段：取消后那一轮结束，队列才继续动。
+
+返回 `{ sessionId, accepted, reason? }`。`accepted=true` 才代表真有轮次被取消；否则 `accepted=false` 并带 `reason`：
+
+| `reason` | 含义 | 说明 |
+|---|---|---|
+| `idle` | 会话存在但没有正在跑的轮次 | 不会误报成“已取消”；排队的消息原样保留 |
+| `not-found` | 会话不存在 / 已删除 / 不属于当前 profile | 不再抛错，Agent 能直接改 id 重试 |
+
+（0.1.0 的行为是直接透传宿主服务：空闲会话也返回 `accepted=true`，未知 id 则抛错。0.1.1 先查存储再发取消，语义才与结果对得上。）
 
 ## 安装
 
@@ -122,7 +132,8 @@ Host 半侧（本包全部代码）按包名缓存已导入的模块：**禁用/
 
 | 项目 | 值 |
 |---|---|
-| 实测 DSH | `0.2.1-rc.5`（Windows，Node 24.21.0） |
+| 实测 DSH | `0.2.1-rc.5`（Windows，Node 24.21.0）、`0.2.2-rc.3`（macOS arm64，Node 26.12.1） |
+| 平台 | macOS / Linux / Windows。只用 `node:path` 与 `process.platform`，无原生扩展、无平台相关依赖 |
 | Node | `^22.19.0 \|\| >=24.0.0`（与 DSH 生态插件同口径） |
 | 依赖 | 只用 `ctx.sessionController` 与内置 `node:path`，不打包任何第三方依赖 |
 | 构建 | 无。`index.js` 就是发布产物 |
@@ -138,7 +149,9 @@ node --check index.js
 node test/smoke.mjs        # 或 npm test
 ```
 
-`test/smoke.mjs` 离线运行：用一个假的 Cordis 上下文和桩 `sessionController` 驱动真实的 `apply()`，覆盖注册形状、四个工具的每条 `execute()` 路径、参数拒绝与幂等。不需要 DSH 进程、端口或交互。
+`test/smoke.mjs` 离线运行：用一个假的 Cordis 上下文和桩 `sessionController` 驱动真实的 `apply()`，覆盖注册形状、四个工具的每条 `execute()` 路径、参数拒绝、幂等、以及 `session_cancel` 的三种结局（running / idle / not-found）。不需要 DSH 进程、端口或交互，74 项断言。
+
+测试夹具按 `process.platform` 取路径风格，所以同一份测试在 macOS、Linux、Windows 上都能跑；CI（`.github/workflows/ci.yml`）在三个平台 × Node 22/24 上各跑一遍。
 
 ## 许可
 

@@ -27,6 +27,15 @@
 
 import { isAbsolute } from 'node:path'
 
+/** Host platform facts, used for path diagnostics (macOS/Linux vs Windows). */
+const IS_WINDOWS = process.platform === 'win32'
+
+/** `C:\\x`, `C:/x`, `\\server\share` — absolute on Windows, plain text on POSIX. */
+const WINDOWS_ABSOLUTE = /^(?:[A-Za-z]:[\\/]|\\\\)/
+
+/** What an absolute path looks like on the Host that is running now. */
+const PLATFORM_HINT = IS_WINDOWS ? 'C:\\proj 这样的 Windows 绝对路径' : '/home/me/proj 这样的 POSIX 绝对路径'
+
 export const name = 'dsh-agent-session-tools'
 
 /** Wait for the tool registry; `sessionController` is resolved lazily per call. */
@@ -59,6 +68,44 @@ function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
 }
 
+/**
+ * Validate a caller-supplied working directory and return it unchanged.
+ *
+ * `node:path`'s `isAbsolute` is platform-bound: `E:\proj` is absolute on Windows
+ * and plain relative text on macOS/Linux. Reporting a Windows path as "relative"
+ * on a POSIX Host hides the real mistake, so each case gets its own message.
+ */
+function assertAbsoluteCwd(cwd) {
+  if (isAbsolute(cwd)) return cwd
+  if (!IS_WINDOWS && WINDOWS_ABSOLUTE.test(cwd)) {
+    throw new Error(
+      `cwd 是 Windows 绝对路径，但当前 Host 运行在 ${process.platform} 上，无法使用：${cwd}。请改传 ${PLATFORM_HINT}。`,
+    )
+  }
+  throw new Error(
+    `cwd 必须是绝对路径，收到的是相对路径：${cwd}（当前 Host 是 ${process.platform}，请传 ${PLATFORM_HINT}）`,
+  )
+}
+
+/**
+ * Best-effort state of one session: `'running' | 'idle' | 'missing' | 'unknown'`.
+ *
+ * `'unknown'` means the store could not be read; callers then let the service's
+ * own answer decide instead of inventing one.
+ */
+async function sessionState(controller, sessionId) {
+  let items
+  try {
+    const value = await controller.list({}, signalOf())
+    items = Array.isArray(value?.items) ? value.items : []
+  } catch {
+    return 'unknown'
+  }
+  const found = items.find((item) => String(item?.sessionId) === sessionId)
+  if (!found) return 'missing'
+  return found.running === true ? 'running' : 'idle'
+}
+
 /* ─────────────────────────────── tools ─────────────────────────────── */
 
 function createSessionTool(ctx) {
@@ -71,7 +118,8 @@ function createSessionTool(ctx) {
       properties: {
         cwd: {
           type: 'string',
-          description: '新会话的工作目录绝对路径（如 E:\\proj 或 /home/me/proj）。省略时使用 Harness 默认工作目录。',
+          description:
+            '新会话的工作目录绝对路径，须与宿主平台一致（macOS/Linux 如 /home/me/proj，Windows 如 C:\\proj）。省略时使用 Harness 默认工作目录。',
         },
         agentPreset: {
           type: 'string',
@@ -113,10 +161,7 @@ function createSessionTool(ctx) {
         // A relative path would be resolved against the Host process's cwd,
         // which the caller never sees — reject it instead of creating a
         // Session in an unexpected place.
-        if (!isAbsolute(cwd)) {
-          throw new Error(`cwd 必须是绝对路径，收到的是相对路径：${cwd}`)
-        }
-        request.cwd = cwd
+        request.cwd = assertAbsoluteCwd(cwd)
       }
 
       const agentPreset = nonEmptyString(args.agentPreset)
@@ -308,7 +353,7 @@ function createCancelTool(ctx) {
   return {
     name: 'session_cancel',
     description:
-      '取消某个会话当前正在执行的轮次（不丢弃已排队的消息）。用于解救卡在未结算工具调用上的会话：取消后该轮结束，先前排队的注入消息才有机会被消费。',
+      '取消某个会话当前正在执行的轮次（不丢弃已排队的消息）。用于解救卡在未结算工具调用上的会话：取消后该轮结束，先前排队的注入消息才有机会被消费。会话空闲或不存在时返回 accepted=false 并说明原因（reason=idle / not-found），不会误报为已取消。',
     parameters: {
       type: 'object',
       properties: {
@@ -326,6 +371,7 @@ function createCancelTool(ctx) {
         properties: {
           sessionId: { type: 'string' },
           accepted: { type: 'boolean' },
+          reason: { type: 'string', enum: ['idle', 'not-found'] },
         },
         required: ['sessionId', 'accepted'],
         additionalProperties: false,
@@ -335,7 +381,9 @@ function createCancelTool(ctx) {
           type: 'text',
           text: value.accepted
             ? `已请求取消会话 ${value.sessionId} 的当前轮次。`
-            : `会话 ${value.sessionId} 没有可取消的活动轮次。`,
+            : value.reason === 'not-found'
+              ? `找不到会话 ${value.sessionId}：它不存在、已被删除，或不属于当前 profile。`
+              : `会话 ${value.sessionId} 当前空闲，没有可取消的轮次（已排队的消息不受影响）。`,
         },
       ],
     },
@@ -345,8 +393,24 @@ function createCancelTool(ctx) {
       if (!sessionId) throw new Error('sessionId 不能为空。')
 
       const controller = controllerOf(ctx)
-      const result = await controller.cancel({ sessionId })
-      return { sessionId, accepted: result?.accepted === true }
+
+      // `controller.cancel` answers accepted=true even for an idle session and
+      // throws for an unknown id, so ask the store first: the useful answer is
+      // "there is no turn to cancel", not "request accepted".
+      const state = await sessionState(controller, sessionId)
+      if (state === 'missing') return { sessionId, accepted: false, reason: 'not-found' }
+      if (state === 'idle') return { sessionId, accepted: false, reason: 'idle' }
+
+      try {
+        const result = await controller.cancel({ sessionId })
+        if (result?.accepted === true) return { sessionId, accepted: true }
+        return { sessionId, accepted: false, reason: 'idle' }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        // Race: the session was removed between the check and the cancel.
+        if (/not found|not attached/i.test(message)) return { sessionId, accepted: false, reason: 'not-found' }
+        throw error
+      }
     },
   }
 }
