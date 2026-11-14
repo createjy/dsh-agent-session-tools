@@ -149,9 +149,9 @@ node --check index.js
 node test/smoke.mjs        # 或 npm test
 ```
 
-`test/smoke.mjs` 离线运行：用一个假的 Cordis 上下文和桩 `sessionController` 驱动真实的 `apply()`，覆盖注册形状、四个工具的每条 `execute()` 路径、参数拒绝、幂等、以及 `session_cancel` 的三种结局（running / idle / not-found）。不需要 DSH 进程、端口或交互，74 项断言。
+`test/smoke.mjs` 离线运行：用一个假的 Cordis 上下文和桩 `sessionController` 驱动真实的 `apply()`，覆盖注册形状、四个工具的每条 `execute()` 路径、参数拒绝、幂等、以及 `session_cancel` 的三种结局（running / idle / not-found）。不需要 DSH 进程、端口或交互，74 项断言（Windows 上 72 项：POSIX 专属的 3 项换成 1 项 Windows 专属检查）。
 
-测试夹具按 `process.platform` 取路径风格，所以同一份测试在 macOS、Linux、Windows 上都能跑；CI（`.github/workflows/ci.yml`）在三个平台 × Node 22/24 上各跑一遍。
+测试夹具按 `process.platform` 取路径风格，所以同一份测试在 macOS、Linux、Windows 上都能跑；CI（`.github/workflows/ci.yml`）在三个平台 × Node 22/24 上各跑一遍，六个 job 已实测全绿。
 
 ## 许可
 

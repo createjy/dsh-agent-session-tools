@@ -22,8 +22,8 @@
 
 ### 测试
 
-- 断言 59 → 74：新增 `session_cancel` 的三种结局（running / idle / not-found）、存储不可读时的回退路径、跨平台 `cwd` 拒绝。
-- 新增 `.github/workflows/ci.yml`：macOS / Ubuntu / Windows × Node 22 / 24 全矩阵跑 `node --check` + `npm test`。
+- 断言 59 → 74（Windows 上 72：POSIX 专属的 3 项换成 1 项 Windows 专属检查）：新增 `session_cancel` 的三种结局（running / idle / not-found）、存储不可读时的回退路径、跨平台 `cwd` 拒绝。
+- 新增 `.github/workflows/ci.yml`：macOS / Ubuntu / Windows × Node 22 / 24 全矩阵跑 `node --check` + `npm test`；六个 job 已在 CI 上实跑通过。
 
 ## 0.1.0 — 2026-11-01
 

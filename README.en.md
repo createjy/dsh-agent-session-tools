@@ -142,9 +142,9 @@ node --check index.js
 node test/smoke.mjs        # or npm test
 ```
 
-`test/smoke.mjs` runs offline: a fake Cordis context and a stub `sessionController` drive the real `apply()`, covering registration shape, every `execute()` path, argument rejection, idempotency, and the three `session_cancel` outcomes (running / idle / not-found). No DSH process, port or interaction needed — 74 assertions.
+`test/smoke.mjs` runs offline: a fake Cordis context and a stub `sessionController` drive the real `apply()`, covering registration shape, every `execute()` path, argument rejection, idempotency, and the three `session_cancel` outcomes (running / idle / not-found). No DSH process, port or interaction needed — 74 assertions (72 on Windows: the three POSIX-only checks are replaced by one Windows-only one).
 
-Fixtures pick their path style from `process.platform`, so the same suite runs on macOS, Linux and Windows; CI (`.github/workflows/ci.yml`) runs it on all three × Node 22/24.
+Fixtures pick their path style from `process.platform`, so the same suite runs on macOS, Linux and Windows; CI (`.github/workflows/ci.yml`) runs it on all three × Node 22/24 — six jobs, all green.
 
 ## License
 
